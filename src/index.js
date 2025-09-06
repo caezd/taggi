@@ -54,8 +54,17 @@ export default class Taggi {
    */
   init() {
     Object.entries(this.config).forEach(([tagName, tag]) => {
-      const selector = tag.selector || this.options.defaultSelector;
-      const elements = document.querySelectorAll(selector);
+      // Normaliser les selectors
+      let selectors = tag.selector || this.options.defaultSelector;
+      if (!Array.isArray(selectors)) selectors = [selectors];
+
+      // Récupérer tous les éléments correspondant aux selectors
+      let elements = [];
+      selectors.forEach((sel) => {
+        elements = elements.concat([...document.querySelectorAll(sel)]);
+      });
+
+      if (!elements.length) return;
 
       elements.forEach((el) => {
         const original = el.innerHTML;
@@ -70,8 +79,6 @@ export default class Taggi {
           // sinon on utilise le shortcode classique
           parsed = this.parseShortcode(original, tagName, tag);
         }
-
-        console.log(parsed);
 
         el.innerHTML = parsed.content;
 
@@ -130,7 +137,7 @@ export default class Taggi {
       // match[0] = texte complet
       // match[1..n] = groupes capturés
       const groups = match.slice(1);
-      const rendered = tag.output(...groups); // note : tu utilises output, pas template
+      const rendered = tag.output(...groups);
       found.push(rendered);
 
       // Supprime le texte original correspondant
