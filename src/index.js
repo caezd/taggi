@@ -1,149 +1,216 @@
 /**
- * Taggi.js
- * ============
- * Plugin de parsing de shortcodes dans les titres Forumactif (ou autre DOM).
- * Chaque shortcode est défini dans une config, avec :
- *   - selector : où chercher le shortcode dans le DOM
- *   - inject   : où réinjecter la balise (facultatif)
- *   - output   : fonction qui retourne le rendu HTML
- *
- * Exemple d’utilisation :
- *
- * const taggiConfig = {
- *   hashtag: {
- *     selector: ".post-title",        // où parser les shortcodes
- *     inject: ".post-tags",           // où réinjecter les balises détectées
- *     output: (content) => `<span class="taggi-hashtag">#${content}</span>`
- *   },
- *   icon: {
- *     selector: ".post-title",
- *     output: (content) => `<i class="taggi-icon">${content}</i>`
- *   }
- * };
- *
- * // Démarrage automatique :
- * new Taggi(taggiConfig);
- *
- * HTML d’entrée :
- * <h2 class="post-title">Sujet [hashtag urgent] [icon ⭐]</h2>
- * <div class="post-tags"></div>
- *
- * HTML rendu automatiquement :
- * <h2 class="post-title">Sujet <span class="taggi-hashtag">#urgent</span> <i class="taggi-icon">⭐</i></h2>
- * <div class="post-tags"><span class="taggi-hashtag">#urgent</span></div>
+ * Taggi.js (cleaned)
+ * ------------------
+ * - Parses shortcodes per tag (single pass per element per tag).
+ * - Optional regex-based extraction per tag.
+ * - Rewrites the source HTML every run (shortcodes/regex are removed).
+ * - Idempotent injection using invisible comment anchors (no DOM duplication).
  */
 
-export default class Taggi {
-  constructor(config, options = {}) {
-    this.config = config;
-    this.options = Object.assign(
-      {
-        // default options
-        defaultSelector: ".taggit",
-        debug: true,
-        fallbackOutput: (content, tagName) =>
-          `<span class="taggit" data-tag="${tagName}">${content}</span>`,
-      },
-      options
+// ---- Injection helpers (comment-anchored, no layout impact) ----
+
+function normalizeInside(pos) {
+    switch (pos) {
+        case "afterbegin":
+        case "beforeend":
+            return pos;
+        case "after": // legacy alias
+            return "afterbegin";
+        case "before": // legacy alias
+            return "beforeend";
+        default:
+            return "beforeend";
+    }
+}
+
+/**
+ * Ajout : support de la syntaxe `inject: "!selector"` pour forcer `el.closest(selector)`
+ * -------------------------------------------------------------------------------
+ * - Si `inject` est une **fonction**, on appelle la fonction avec `el` (inchangé).
+ * - Si `inject` est une **string** qui **commence par `!`**, on enlève le `!` et
+ * on retourne **strictement** `el.closest(selector)`.
+ * - Sinon (string sans `!`), on conserve le comportement souple précédent :
+ * `el.closest(selector) || document.querySelector(selector)`.
+ */
+
+function resolveInjectTarget(inject, el) {
+    if (typeof inject === "function") return inject(el);
+    if (typeof inject === "string") {
+        const raw = inject.trim();
+        if (!raw) return null;
+        if (raw.startsWith("!")) {
+            const sel = raw.slice(1).trim();
+            if (!sel) return null;
+            return el.closest ? el.closest(sel) : null; // forcer closest uniquement
+        }
+        // comportement par défaut : d'abord proche, sinon global
+        return el.closest?.(raw) || document.querySelector(raw);
+    }
+    return null;
+}
+
+function setCommentBlock(target, tagName, htmlList, pos = "beforeend") {
+    const { start, end } = ensureCommentBlock(target, tagName, pos);
+    // 1) Remove previous content between anchors
+    let n = start.nextSibling;
+    while (n && n !== end) {
+        const next = n.nextSibling;
+        n.parentNode.removeChild(n);
+        n = next;
+    }
+    // 2) Deduplicate and insert
+    const unique = Array.from(new Set(htmlList));
+    if (!unique.length) return;
+    const tpl = document.createElement("template");
+    tpl.innerHTML = unique.join("");
+    start.parentNode.insertBefore(tpl.content, end);
+}
+
+function ensureCommentBlock(target, tagName, pos = "beforeend") {
+    const startSig = `taggi:start:${tagName}`;
+    const endSig = `taggi:end:${tagName}`;
+    let start = findComment(target, startSig);
+    let end = findComment(target, endSig);
+    if (!start || !end) {
+        target.insertAdjacentHTML(pos, `<!--${startSig}--><!--${endSig}-->`);
+        start = findComment(target, startSig);
+        end = findComment(target, endSig);
+    }
+    return { start, end };
+}
+
+function findComment(root, text) {
+    const walker = document.createTreeWalker(
+        root,
+        NodeFilter.SHOW_COMMENT,
+        null
     );
-    this.init();
-  }
+    let n;
+    while ((n = walker.nextNode())) {
+        if (n.nodeValue === text) return n;
+    }
+    return null;
+}
 
-  /**
-   * Parcourt la config et applique tout automatiquement
-   */
-  init() {
-    Object.entries(this.config).forEach(([tagName, tag]) => {
-      // Normaliser les selectors
-      let selectors = tag.selector || this.options.defaultSelector;
-      if (!Array.isArray(selectors)) selectors = [selectors];
+// --- helpers root & serialization ---
+function resolveRoot(root) {
+    if (!root) return document;
+    if (typeof root === "string") {
+        const tpl = document.createElement("template");
+        tpl.innerHTML = root;
+        return tpl.content; // DocumentFragment
+    }
+    // Element | DocumentFragment | Document
+    return root;
+}
 
-      // Récupérer tous les éléments correspondant aux selectors
-      let elements = [];
-      selectors.forEach((sel) => {
-        elements = elements.concat([...document.querySelectorAll(sel)]);
-      });
-
-      if (!elements.length) return;
-
-      elements.forEach((el) => {
-        const original = el.innerHTML;
-        let parsed;
-
-        // Si une regex est définie, on l'utilise
-
-        if (tag.regex) {
-          parsed = this.parseRegex(original, tag);
-          console.log(parsed);
-        } else {
-          // sinon on utilise le shortcode classique
-          parsed = this.parseShortcode(original, tagName, tag);
-        }
-
-        el.innerHTML = parsed.content;
-
-        if (tag.inject && parsed.found.length) {
-          let injectTarget;
-
-          if (typeof tag.inject === "function") {
-            injectTarget = tag.inject(el);
-          } else if (typeof tag.inject === "string") {
-            injectTarget = document.querySelector(tag.inject);
-          }
-
-          if (!injectTarget) return;
-
-          parsed.found.forEach((rendered) => {
-            injectTarget.insertAdjacentHTML(
-              `${tag.position || "before"}end`,
-              rendered
-            );
-          });
-        }
-      });
-    });
-  }
-
-  parseShortcode(text, tagName, tag) {
-    const regex = /\[([^\s\]]+)\s+([^\]]+)\]/g; // capture [tagName content]
-    const found = [];
-
-    const content = text.replace(regex, (match, name, inner) => {
-      let rendered;
-
-      if (this.config[name]) {
-        rendered = this.config[name].output(inner, name);
-      } else if (this.options.fallbackOutput) {
-        rendered = this.options.fallbackOutput(inner, name);
-      } else {
-        rendered = match;
-      }
-
-      found.push(rendered);
-      return rendered;
-    });
-
-    return { content, found };
-  }
-
-  parseRegex(text, tag) {
-    const found = [];
-    let content = text;
-
-    const regex = tag.regex;
-    let match;
-
-    while ((match = regex.exec(text)) !== null) {
-      // match[0] = texte complet
-      // match[1..n] = groupes capturés
-      const groups = match.slice(1);
-      const rendered = tag.output(...groups);
-      found.push(rendered);
-
-      // Supprime le texte original correspondant
-      content = content.replace(match[0], "");
+/**
+ * Taggi main class
+ * ----------------
+ * - config: { tagName: { selector, output, inject, position, regex } }
+ * - options: { defaultSelector, fallbackOutput }
+ */
+export default class Taggi {
+    constructor(config, options = {}) {
+        this.config = config || {};
+        this.options = Object.assign(
+            {
+                defaultSelector: ".taggit",
+                fallbackOutput: (content, tagName) =>
+                    `<span class="taggit" data-tag="${tagName}">${content}</span>`,
+            },
+            options
+        );
+        this.init();
     }
 
-    return { content, found };
-  }
+    /** Walk the config and apply parsing + injections. */
+    init(root) {
+        const scope = resolveRoot(root);
+        Object.entries(this.config).forEach(([tagName, tag]) => {
+            // 1) selectors -> unique elements
+            let selectors = tag.selector || this.options.defaultSelector;
+            if (!Array.isArray(selectors)) selectors = [selectors];
+            const elements = Array.from(
+                new Set(
+                    selectors.flatMap((sel) =>
+                        Array.from(scope.querySelectorAll(sel))
+                    )
+                )
+            );
+            if (!elements.length) return;
+
+            // 2) Aggregate rendered fragments per injection target
+            const buckets = new Map(); // Map<HTMLElement, string[]>
+
+            elements.forEach((el) => {
+                const original = el.innerHTML;
+                const parsed = tag.regex
+                    ? this.parseRegex(original, tag)
+                    : this.parseShortcodeForTag(original, tagName, tag);
+
+                if (parsed.content !== original) el.innerHTML = parsed.content;
+
+                if (tag.inject && parsed.found.length) {
+                    const target = resolveInjectTarget(tag.inject, el);
+                    if (!target) return;
+                    if (!buckets.has(target)) buckets.set(target, []);
+                    buckets.get(target).push(...parsed.found);
+                }
+            });
+
+            // 3) Injection: rewrite the per-tag comment block (no duplicates)
+            if (tag.inject && buckets.size) {
+                const pos = normalizeInside(tag.position);
+                for (const [target, arr] of buckets) {
+                    setCommentBlock(target, tagName, arr, pos);
+                }
+            }
+        });
+    }
+
+    /** Parse only the current tag's shortcodes: [tagName content] */
+    parseShortcodeForTag(text, tagName, tag) {
+        const re = /\[([^\s\]]+)\s+([^\]]+)\]/g;
+        const found = [];
+        const content = text.replace(re, (m, name, inner) => {
+            if (name !== tagName) return m;
+            const render =
+                (tag && typeof tag.output === "function" && tag.output) ||
+                this.options.fallbackOutput;
+            const html = render(inner, name);
+            found.push(html);
+            if (tag && tag.inject) return "";
+            return html;
+        });
+        return { content, found };
+    }
+
+    /**
+     * Regex-based extraction for a tag.
+     * NOTE: we ensure the 'g' flag to avoid infinite loops with exec().
+     * Expected: tag.output(...groups) -> string (rendered).
+     * Behavior: matched text is removed from source (returns via 'found' for injection).
+     */
+    parseRegex(text, tag) {
+        const found = [];
+        let content = text;
+
+        const flags = tag.regex.flags.includes("g")
+            ? tag.regex.flags
+            : tag.regex.flags + "g";
+        const re = new RegExp(tag.regex.source, flags);
+        const reForReplace = new RegExp(tag.regex.source, flags);
+
+        let match;
+        while ((match = re.exec(text)) !== null) {
+            const rendered = tag.output(...match.slice(1));
+            found.push(rendered);
+        }
+
+        // Remove all matched segments from content
+        content = content.replace(reForReplace, "");
+
+        return { content, found };
+    }
 }
